@@ -40,6 +40,7 @@ from verl.utils.fs import copy_to_local
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils.rollout_trace import RolloutTraceConfig, rollout_trace_attr, rollout_trace_op
 from verl.workers.rollout.replica import TokenOutput, get_rollout_replica_class
+from verl.experimental.transfer_queue.metadata import BatchMeta
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -398,13 +399,30 @@ class AgentLoopWorker:
             trace_config.get("token2text", False),
         )
 
-    async def generate_sequences(self, batch: DataProto) -> DataProto:
+
+    def create_client(self):
+        """Create client for agent loop worker."""
+        from verl.experimental.transfer_queue import TransferQueueClient
+
+        client_id = None
+        controller_infos = []
+        storage_infos = []
+
+        self.client = TransferQueueClient(
+            client_id=client_id,
+            controller_infos=controller_infos,
+            storage_infos=storage_infos
+        )
+
+
+    async def generate_sequences(self, batch_meta: BatchMeta) -> BatchMeta:
         """Generate sequences from agent loop.
 
         Args:
-            batch (DataProto): Input batch.
+            batch_meta (BatchMeta): Input batch metadata.
 
         Returns:
+            TODO(baymax): need fix
             DataProto: Output batch.
             - prompts: [bsz, prompt_length], prompt token ids from dataset.
             - responses: [bsz, response_length], output token ids include response tokens
@@ -428,6 +446,8 @@ class AgentLoopWorker:
         )
 
         # override sampling params for validation
+        batch = self.client.get_data(batch_meta)
+
         if batch.meta_info.get("validate", False):
             sampling_params["top_p"] = config.val_kwargs.top_p
             sampling_params["temperature"] = config.val_kwargs.temperature
@@ -452,7 +472,11 @@ class AgentLoopWorker:
         outputs = await asyncio.gather(*tasks)
 
         output = self._postprocess(outputs)
-        return output
+
+        self.client.put(output, batch_meta)
+        batch_meta.add_fields(output)
+
+        return batch_meta
 
     async def _run_agent_loop(
         self,
@@ -791,23 +815,25 @@ class AgentLoopManager:
                 ).remote(self.config, self.server_handles, self.rm_executor)
             )
 
-    def generate_sequences(self, prompts: DataProto) -> DataProto:
+    def generate_sequences(self, batch_meta: BatchMeta) -> BatchMeta:
         """Split input batch and dispatch to agent loop workers.
 
         Args:
-            prompts (DataProto): Input batch.
+            batch_meta (BatchMeta): Input batch metadata.
 
         Returns:
-            DataProto: Output batch.
+            BatchMeta: Output batch metadata.
         """
 
-        if self.rm_micro_batch_size and len(prompts) % self.rm_micro_batch_size != 0:
+        if self.rm_micro_batch_size and len(batch_meta) % self.rm_micro_batch_size != 0:
             raise ValueError(
-                f"The length of prompts {len(prompts)} cannot divide the world size of rm_wg {self.rm_micro_batch_size}"
+                f"The length of batch_meta {len(batch_meta)} cannot divide the world size of rm_wg {self.rm_micro_batch_size}"
             )
         if self.config.actor_rollout_ref.rollout.free_cache_engine:
             self.wake_up()
-        chunkes = prompts.chunk(len(self.agent_loop_workers))
+
+        # TODO(baymax): is batch_meta.chunk() supported?
+        chunkes = batch_meta.chunk(len(self.agent_loop_workers))
         outputs = ray.get(
             [
                 worker.generate_sequences.remote(chunk)
